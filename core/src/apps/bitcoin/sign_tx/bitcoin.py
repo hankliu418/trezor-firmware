@@ -151,7 +151,8 @@ class Bitcoin:
             )
             if prev_amount != txi.amount:
                 raise wire.DataError("Invalid amount specified")
-            self.verify_signed_input(txi, script_pubkey)
+
+            await self.verify_signed_input(i, txi, script_pubkey)
 
         # check that the inputs were the same as those streamed for confirmation
         if self.h_external.get_digest() != h_check.get_digest():
@@ -250,25 +251,61 @@ class Bitcoin:
         self.hash143_add_output(txo, script_pubkey)
         self.total_out += txo.amount
 
-    def verify_signed_input(self, txi: TxInputType, script_pubkey: bytes) -> None:
-        pubkey_hash = scripts.get_p2wpkh_pubkey_hash(
-            txi.script_sig, script_pubkey, self.coin
-        )
-        if not pubkey_hash:
-            raise wire.DataError("Only P2WPKH script verification supported")
+    async def get_legacy_tx_digest(self, i_verify: int, script_pubkey: bytes):
+        # the transaction digest which gets verified for this input
+        h_verify = self.create_hash_writer()
+        # should come out the same as h_confirmed, checked before signing the digest
+        h_check = self.create_hash_writer()
 
-        public_key, signature, sighash_type = scripts.read_witness_p2wpkh(txi.witness)
+        self.write_tx_header(h_verify, self.tx, witness_marker=False)
+        write_bitcoin_varint(h_verify, self.tx.inputs_count)
+
+        for i in range(self.tx.inputs_count):
+            txi = await helpers.request_tx_input(self.tx_req, i, self.coin)
+            writers.write_tx_input_check(h_check, txi)
+            if i == i_verify:
+                self.write_tx_input(h_verify, txi, script_pubkey)
+            else:
+                self.write_tx_input(h_verify, txi, bytes())
+
+        write_bitcoin_varint(h_verify, self.tx.outputs_count)
+
+        for i in range(self.tx.outputs_count):
+            txo = await helpers.request_tx_output(self.tx_req, i, self.coin)
+            script_pubkey_out = self.output_derive_script(txo)
+            self.write_tx_output(h_check, txo, script_pubkey_out)
+            self.write_tx_output(h_verify, txo, script_pubkey_out)
+
+        writers.write_uint32(h_verify, self.tx.lock_time)
+        writers.write_uint32(h_verify, self.get_hash_type())
+
+        # check that the inputs were the same as those streamed for confirmation
+        if self.h_confirmed.get_digest() != h_check.get_digest():
+            raise wire.ProcessError("Transaction has changed during verification")
+
+        return writers.get_tx_hash(h_verify, double=self.coin.sign_hash_double)
+
+    async def verify_signed_input(
+        self, i: int, txi: TxInputType, script_pubkey: bytes
+    ) -> None:
+        public_key, signature, sighash_type = scripts.get_pubkey_and_signature(
+            script_pubkey, txi.script_sig, txi.witness, self.coin
+        )
+
         if sighash_type != SIGHASH_ALL:
             raise wire.DataError("Only SIGHASH_ALL sighash type supported")
 
-        hash143_hash = self.hash143_preimage_hash(txi, pubkey_hash)
-        if ecdsa_hash_pubkey(public_key, self.coin) != pubkey_hash:
-            raise wire.DataError("Invalid public key hash")
+        if txi.witness or self.coin.force_bip143:
+            tx_digest = self.hash143_preimage_hash(
+                txi, ecdsa_hash_pubkey(public_key, self.coin)
+            )
+        else:
+            tx_digest = await self.get_legacy_tx_digest(i, script_pubkey)
 
         try:
-            valid = ecdsa_verify(public_key, signature, hash143_hash)
+            valid = ecdsa_verify(public_key, signature, tx_digest)
         except Exception:
-            raise wire.DataError("Invalid witness data")
+            raise wire.DataError("Invalid signature")
 
         if not valid:
             raise wire.DataError("Invalid signature")
