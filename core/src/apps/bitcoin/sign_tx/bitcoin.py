@@ -46,11 +46,11 @@ class Bitcoin:
         # sum of output amounts.
         await self.step2_confirm_outputs()
 
-        # Verify external inputs which have been already signed.
-        await self.step3_verify_signed_inputs()
-
         # Check fee, confirm lock_time and total.
-        await self.step4_confirm_tx()
+        await self.step3_confirm_tx()
+
+        # Verify external inputs which have already been signed.
+        await self.step4_verify_external_inputs()
 
         # Check that inputs are unchanged. Serialize inputs and sign the non-segwit ones.
         await self.step5_serialize_inputs()
@@ -138,7 +138,22 @@ class Bitcoin:
             self.weight.add_output(script_pubkey)
             await self.confirm_output(txo, script_pubkey)
 
-    async def step3_verify_signed_inputs(self) -> None:
+    async def step3_confirm_tx(self) -> None:
+        fee = self.total_in - self.total_out
+
+        if fee < 0:
+            self.on_negative_fee()
+
+        # fee > (coin.maxfee per byte * tx size)
+        if fee > (self.coin.maxfee_kb / 1000) * (self.weight.get_total() / 4):
+            await helpers.confirm_feeoverthreshold(fee, self.coin)
+        if self.tx.lock_time > 0:
+            await helpers.confirm_nondefault_locktime(self.tx.lock_time)
+        await helpers.confirm_total(
+            self.total_in - self.external_in - self.change_out, fee, self.coin
+        )
+
+    async def step4_verify_external_inputs(self) -> None:
         # should come out the same as h_external, checked before continuing
         h_check = self.create_hash_writer()
 
@@ -157,21 +172,6 @@ class Bitcoin:
         # check that the inputs were the same as those streamed for confirmation
         if self.h_external.get_digest() != h_check.get_digest():
             raise wire.ProcessError("Transaction has changed during signing")
-
-    async def step4_confirm_tx(self) -> None:
-        fee = self.total_in - self.total_out
-
-        if fee < 0:
-            self.on_negative_fee()
-
-        # fee > (coin.maxfee per byte * tx size)
-        if fee > (self.coin.maxfee_kb / 1000) * (self.weight.get_total() / 4):
-            await helpers.confirm_feeoverthreshold(fee, self.coin)
-        if self.tx.lock_time > 0:
-            await helpers.confirm_nondefault_locktime(self.tx.lock_time)
-        await helpers.confirm_total(
-            self.total_in - self.external_in - self.change_out, fee, self.coin
-        )
 
     async def step5_serialize_inputs(self) -> None:
         self.write_tx_header(self.serialized_tx, self.tx, bool(self.segwit))
@@ -234,6 +234,9 @@ class Bitcoin:
         self.total_in += prev_amount
 
     async def process_external_input(self, txi: TxInputType) -> None:
+        if txi.amount is None:
+            raise wire.DataError("Expected input with amount")
+
         writers.write_tx_input_check(self.h_external, txi)
         writers.write_tx_input_check(self.h_confirmed, txi)
         self.hash143_add_input(txi)  # all inputs are included (non-segwit as well)
