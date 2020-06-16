@@ -58,3 +58,8 @@ GetOwnershipProof.ownership_ids                             max_count:15 max_siz
 GetOwnershipProof.commitment_data                           max_size:32
 
 OwnershipProof.ownership_proof                              max_size:171
+
+GetOwnershipId.address_n                                    max_count:8
+GetOwnershipId.coin_name                                    max_size:21
+
+OwnershipId.ownership_id                                    max_size:32
