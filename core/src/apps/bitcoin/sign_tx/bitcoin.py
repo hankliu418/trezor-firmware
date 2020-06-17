@@ -18,7 +18,7 @@ from apps.common import coininfo, seed
 from apps.common.writers import write_bitcoin_varint
 
 from .. import addresses, common, multisig, scripts, writers
-from ..common import SIGHASH_ALL, ecdsa_hash_pubkey, ecdsa_sign, ecdsa_verify
+from ..common import SIGHASH_ALL, ecdsa_hash_pubkey, ecdsa_sign
 from ..ownership import verify_nonownership
 from . import helpers, progress, tx_weight
 from .matchcheck import MultisigFingerprintChecker, WalletPathChecker
@@ -303,27 +303,21 @@ class Bitcoin:
     async def verify_signed_input(
         self, i: int, txi: TxInputType, script_pubkey: bytes
     ) -> None:
-        public_key, signature, sighash_type = scripts.get_pubkey_and_signature(
+        verifier = scripts.get_signature_verifier(
             script_pubkey, txi.script_sig, txi.witness, self.coin
         )
 
-        if sighash_type != SIGHASH_ALL:
+        if not verifier.check_sighhash_type(SIGHASH_ALL):
             raise wire.DataError("Only SIGHASH_ALL sighash type supported")
 
         if txi.witness or self.coin.force_bip143:
-            tx_digest = self.hash143_preimage_hash(
-                txi, ecdsa_hash_pubkey(public_key, self.coin)
+            tx_digest = self.hash143_preimage_hash(  # TODO this won't work for multisig
+                txi, ecdsa_hash_pubkey(verifier.public_keys[0], self.coin)
             )
         else:
             tx_digest = await self.get_legacy_tx_digest(i, script_pubkey)
 
-        try:
-            valid = ecdsa_verify(public_key, signature, tx_digest)
-        except Exception:
-            raise wire.DataError("Invalid signature")
-
-        if not valid:
-            raise wire.DataError("Invalid signature")
+        verifier.verify(tx_digest)
 
     def on_negative_fee(self) -> None:
         raise wire.NotEnoughFunds("Not enough funds")

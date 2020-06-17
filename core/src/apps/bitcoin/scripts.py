@@ -106,16 +106,16 @@ def output_derive_script(address: str, coin: CoinInfo) -> bytes:
     raise wire.DataError("Invalid address type")
 
 
-def get_pubkey_and_signature(
+def get_signature_verifier(
     script_pubkey: bytes, script_sig: bytes, witness: bytes, coin: CoinInfo
-) -> Tuple[bytes, bytes, int]:
+) -> common.SignatureVerifier:
     # P2WPKH or P2WPKH nested in BIP16 P2SH
     pubkey_hash = get_p2wpkh_pubkey_hash(script_sig, script_pubkey, coin)
     if pubkey_hash:
         public_key, signature, sighash_type = read_witness_p2wpkh(witness)
         if common.ecdsa_hash_pubkey(public_key, coin) != pubkey_hash:
             raise wire.DataError("Invalid public key hash")
-        return public_key, signature, sighash_type
+        return common.SignatureVerifier([public_key], [(signature, sighash_type)])
 
     # P2PKH
     pubkey_hash = get_p2pkh_pubkey_hash(script_pubkey)
@@ -125,7 +125,16 @@ def get_pubkey_and_signature(
         )
         if common.ecdsa_hash_pubkey(public_key, coin) != pubkey_hash:
             raise wire.DataError("Invalid public key hash")
-        return public_key, signature, sighash_type
+        return common.SignatureVerifier([public_key], [(signature, sighash_type)])
+
+    # P2WSH or P2WSH nested in BIP16 P2SH
+    script_hash = get_p2wsh_script_hash(script_sig, script_pubkey, coin)
+    if script_hash:
+        script, signatures = read_witness_p2wsh(witness)
+        if common.ecdsa_hash_pubkey(script, coin) != script_hash:
+            raise wire.DataError("Invalid script hash")
+        public_keys, threshold = read_output_script_multisig(script)
+        return common.SignatureVerifier(public_keys, signatures, threshold)
 
     raise wire.DataError("Unsupported scriptPubKey")
 
@@ -359,6 +368,31 @@ def witness_p2wsh(
     return w
 
 
+def read_witness_p2wsh(witness: bytes) -> Tuple[bytes, List[Tuple[bytes, int]]]:
+    # Get number of witness stack items.
+    item_count, offset = read_bitcoin_varint(witness, 0)
+
+    # Skip over OP_FALSE, which is due to the old OP_CHECKMULTISIG bug.
+    if witness[offset] != 0:
+        raise wire.DataError("Invalid witness.")
+    offset += 1
+
+    signatures = []
+    for i in range(item_count - 2):
+        n, offset = read_bitcoin_varint(witness, offset)
+        signature = witness[offset : offset + n - 1]
+        sighash_type = witness[offset + n - 1]
+        signatures.append((signature, sighash_type))
+        offset += n
+
+    n, offset = read_bitcoin_varint(witness, offset)
+    if offset + n != len(witness):
+        raise wire.DataError("Invalid witness.")
+    script = witness[offset : offset + n]
+
+    return script, signatures
+
+
 def get_p2wpkh_pubkey_hash(
     script_sig: bytes, script_pubkey: bytes, coin: CoinInfo
 ) -> bytes:
@@ -385,6 +419,34 @@ def get_p2wpkh_pubkey_hash(
         pubkey_hash = script_sig[3:]
 
     return pubkey_hash
+
+
+def get_p2wsh_script_hash(
+    script_sig: bytes, script_pubkey: bytes, coin: CoinInfo
+) -> bytes:
+    script_hash = bytes()
+    if (  # P2WSH
+        not script_sig
+        and len(script_pubkey) == 34
+        and script_pubkey[0] == 0x00  # witness version byte
+        and script_pubkey[1] == 0x20  # witness script hash length
+    ):
+        script_hash = script_pubkey[2:]
+    elif (  # P2WSH nested in BIP16 P2SH
+        len(script_pubkey) == 23
+        and script_pubkey[0] == 0xA9  # OP_HASH_160
+        and script_pubkey[1] == 0x14  # pushing 20 bytes of script hash
+        and script_pubkey[22] == 0x87  # OP_EQUAL
+        and len(script_sig) == 35
+        and script_sig[0] == 0x22  # length of the data
+        and script_sig[1] == 0x00  # witness version byte
+        and script_sig[2] == 0x20  # witness script hash length
+    ):
+        if coin.script_hash(script_sig[1:]) != script_pubkey[2:22]:
+            raise wire.DataError("Invalid script hash")
+        script_hash = script_sig[3:]
+
+    return script_hash
 
 
 def get_p2pkh_pubkey_hash(script_pubkey: bytes) -> bytes:
@@ -474,6 +536,33 @@ def write_output_script_multisig(w: Writer, pubkeys: List[bytes], m: int) -> Non
 
 def output_script_multisig_length(pubkeys: List[bytes], m: int) -> int:
     return 1 + len(pubkeys) * (1 + 33) + 1 + 1  # see output_script_multisig
+
+
+def read_output_script_multisig(script: bytes) -> Tuple[List[bytes], int]:
+    if script[-1] != 0xAE:  # OP_CHECKMULTISIG
+        raise wire.DataError("Invalid multisig script")
+
+    if not 0x51 <= script[0] < 0x60 or not 0x51 <= script[-2] < 0x60:
+        raise wire.DataError("Invalid multisig script")
+
+    threshold = script[0] - 0x50
+    pubkey_count = script[-2] - 0x50
+    if threshold > pubkey_count:
+        raise wire.DataError("Invalid multisig script")
+
+    offset = 1
+    public_keys = []
+    for i in range(pubkey_count):
+        n, offset = read_op_push(script, offset)
+        if n != 33:
+            raise wire.DataError("Invalid multisig script")
+        public_keys.append(script[offset : offset + n])
+        offset += n
+
+    if offset + 2 != len(script):
+        raise wire.DataError("Invalid multisig script")
+
+    return public_keys, threshold
 
 
 # OP_RETURN

@@ -97,10 +97,9 @@ def verify_nonownership(
     script_sig = proof[script_sig_offset : script_sig_offset + script_sig_len]
     witness = proof[script_sig_offset + script_sig_len :]
 
-    if not verify_proof_signature(
+    verify_proof_signature(
         proof_body, script_pubkey, commitment_data, script_sig, witness, coin
-    ):
-        raise wire.DataError("Invalid signature in proof of ownership")
+    )
 
     # Determine whether our ownership ID appears in the proof.
     ownership_id = get_identifier(script_pubkey, keychain)
@@ -118,19 +117,13 @@ def verify_proof_signature(
     script_sig: bytes,
     witness: bytes,
     coin: CoinInfo,
-) -> bool:
-    public_key, signature, _ = scripts.get_pubkey_and_signature(
-        script_pubkey, script_sig, witness, coin
-    )
-
+) -> None:
     sighash = hashlib.sha256(proof_body)
     sighash.update(script_pubkey)
     sighash.update(commitment_data)
 
-    try:
-        return common.ecdsa_verify(public_key, signature, sighash.digest())
-    except Exception:
-        raise wire.DataError("Invalid signature in proof of ownership")
+    verifier = scripts.get_signature_verifier(script_pubkey, script_sig, witness, coin)
+    verifier.verify(sighash.digest())
 
 
 def get_identifier(script_pubkey: bytes, keychain: seed.Keychain):

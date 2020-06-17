@@ -9,7 +9,7 @@ from trezor.utils import ensure
 from apps.common.coininfo import CoinInfo
 
 if False:
-    from typing import Dict
+    from typing import Dict, List, Tuple
     from trezor.messages.TxInputType import EnumTypeInputScriptType
     from trezor.messages.TxOutputType import EnumTypeOutputScriptType
 
@@ -91,3 +91,33 @@ def decode_bech32_address(prefix: str, address: str) -> bytes:
     if witver != _BECH32_WITVER:
         raise wire.ProcessError("Invalid address witness program")
     return bytes(raw)
+
+
+class SignatureVerifier:
+    def __init__(
+        self,
+        public_keys: List[bytes],
+        signatures: List[Tuple[bytes, int]],
+        threshold: int = 1,
+    ):
+        self.public_keys = public_keys
+        self.signatures = signatures
+        self.threshold = threshold
+
+    def check_sighhash_type(self, sighash_type: int) -> bool:
+        for signature in self.signatures:
+            if signature[1] != sighash_type:
+                return False
+        return True
+
+    def verify(self, digest: bytes) -> None:
+        if self.threshold != len(self.signatures):
+            raise wire.DataError("Invalid signature")
+
+        try:
+            i = 0
+            for signature in self.signatures:
+                while not ecdsa_verify(self.public_keys[i], signature[0], digest):
+                    i += 1
+        except Exception:
+            raise wire.DataError("Invalid signature")
